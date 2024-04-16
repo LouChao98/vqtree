@@ -10,7 +10,7 @@ import triton
 import triton.language as tl
 
 from flashinfer import merge_state_in_place
-from ops.triton_fused_local_attn2 import flash_attn_func as block_local_attention
+from ops.triton_fused_local_attn_rerope import flash_attn_func as block_local_attention_with_rerope
 
 NEGINF = -1e6
 # NEGINF = float("-inf")
@@ -42,7 +42,7 @@ def _vq_attn_fwd_inner(
         qk = tl.dot(q, k) * (sm_scale * RCP_LN2)
 
         k_vq_cnt = tl.load(K_VQC_block_ptr)
-        mask = k_vq_cnt != 0.
+        mask = k_vq_cnt != 0.0
         qk = tl.where(mask[None, :], qk, NEGINF)
 
         # -- compute scaling constant ---
@@ -141,8 +141,7 @@ def _vq_fwd_kernel(
         order=(0, 1),
     )
     K_VQC_block_ptr = tl.make_block_ptr(
-        base=K_VQ_CNT
-        + (off_b * stride_kvqc_b + off_h * stride_kvqc_h + start_m * stride_kvqc_n),
+        base=K_VQ_CNT + (off_b * stride_kvqc_b + off_h * stride_kvqc_h + start_m * stride_kvqc_n),
         shape=(codebook_size,),
         strides=(1,),
         offsets=(0,),
@@ -150,8 +149,7 @@ def _vq_fwd_kernel(
         order=(0,),
     )
     VVQI_block_ptr = tl.make_block_ptr(
-        base=V_VQ_INDEX
-        + (off_b * stride_vvqi_b + off_h * stride_vvqi_h + start_m * stride_vvqi_n),
+        base=V_VQ_INDEX + (off_b * stride_vvqi_b + off_h * stride_vvqi_h + start_m * stride_vvqi_n),
         shape=(codebook_size,),
         strides=(1,),
         offsets=(0,),
@@ -170,14 +168,17 @@ def _vq_fwd_kernel(
     # fmt: on
 
     acc = acc / l_i[:, None]
-    
+
     # start_m = tl.program_id(0) + WINDOW_SIZE // BLOCK_M
     # offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     # offs_d = tl.arange(0, BLOCK_HEADDIM)
 
     if WRITE_LSE:
         l_ptrs = L + off_hb * seqlen_q + offs_m
-        tl.store(l_ptrs, m_i + tl.math.log2(l_i))
+        if EVEN_M:
+            tl.store(l_ptrs, m_i + tl.math.log2(l_i))
+        else:
+            tl.store(l_ptrs, m_i + tl.math.log2(l_i), mask=offs_m < seqlen_q)
 
     out_ptrs = Out + off_b * stride_o_b + off_h * stride_o_h + (offs_m[:, None] * stride_o_m + offs_d[None, :])
     if EVEN_M:
@@ -186,11 +187,11 @@ def _vq_fwd_kernel(
         tl.store(out_ptrs, acc, mask=offs_m[:, None] < seqlen_q)
 
 
-def vq_attn_forward(q1, q2, k1, k_vq, k_vq_cnt, v, v_vq, vi, window_size, softmax_scale=None):
+def vq_attn_forward(q1, q2, k1, k_vq, k_vq_cnt, k3, v, v_vq, vi, window_size, softmax_scale=None):
     # shape constraints
 
-    q1, q2, k1, k_vq, k_vq_cnt, v, v_vq, vi = [
-        x if x.stride(-1) == 1 else x.contiguous() for x in [q1, q2, k1, k_vq, k_vq_cnt, v, v_vq, vi]
+    q1, q2, k1, k_vq, k_vq_cnt, k3, v, v_vq, vi = [
+        x if x.stride(-1) == 1 else x.contiguous() for x in [q1, q2, k1, k_vq, k_vq_cnt, k3, v, v_vq, vi]
     ]
 
     batch, nheads, seqlen_q, d = q1.shape
@@ -198,9 +199,11 @@ def vq_attn_forward(q1, q2, k1, k_vq, k_vq_cnt, v, v_vq, vi, window_size, softma
     assert BLOCK_HEADDIM == d
     softmax_scale = softmax_scale or 1.0 / math.sqrt(d)
 
-    o1, l1 = block_local_attention(
-        q1.transpose(1, 2),  # TODO unify layout
+    o1, l1 = block_local_attention_with_rerope(
+        q1.transpose(1, 2),
+        q2.transpose(1, 2),
         k1.transpose(1, 2),
+        k3.transpose(1, 2),
         v.transpose(1, 2),
         window_size,
         softmax_scale,
@@ -209,7 +212,7 @@ def vq_attn_forward(q1, q2, k1, k_vq, k_vq_cnt, v, v_vq, vi, window_size, softma
     o1 = o1.transpose(1, 2)
 
     o2 = torch.zeros_like(q1, memory_format=torch.contiguous_format)
-    l2 = torch.full((batch, nheads, seqlen_q), float('-inf'), device=q2.device, dtype=torch.float32)
+    l2 = torch.full((batch, nheads, seqlen_q), float("-inf"), device=q2.device, dtype=torch.float32)
 
     device = torch.cuda.device_of(q1)
     with torch.cuda.device(device):

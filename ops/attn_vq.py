@@ -20,6 +20,8 @@ from contextlib import contextmanager
 
 from ops.mini_vq import multi_head_single_quantize
 
+BLOCK_SIZE = 128  # MUST MATCH KERNEL
+
 
 class AttentionMode(Enum):
     SLOW_REFERNECE = 0
@@ -34,8 +36,12 @@ class VectorQuantizedReRoPECache(Cache):
         self.key_cache: List[torch.Tensor] = []
         self.value_cache: List[torch.Tensor] = []
 
+        self.key_buffers: List[List[torch.Tensor]] = []
+        self.value_buffers: List[List[torch.Tensor]] = []
+
         self.window_length = window_length
         self.codebook = codebook
+        self.rotated_codebook = None
         assert self.codebook.shape[1] % 128 == 0
         self.sphere = sphere
         self.cos_1 = {}
@@ -80,11 +86,51 @@ class VectorQuantizedReRoPECache(Cache):
         """Returns the maximum sequence length of the cached states."""
         return int(1e8)  # some safe number
 
+    def update_prefill(
+        self,
+        cumulated_key,
+        cumulated_value,
+        local_key,  # rope-ed
+        local_value,
+        layer_idx,
+        num_tokens,
+        cache_kwargs,
+    ):
+        sin = cache_kwargs.get("sin")
+        cos = cache_kwargs.get("cos")
+        partial_rotation_size = cache_kwargs.get("partial_rotation_size")
+        using_rope = cos is not None and sin is not None
+
+        assert using_rope, "This is useless for models without RoPE."
+        assert partial_rotation_size is None, "TODO"
+
+        if layer_idx == 0:
+            self.seen_tokens += num_tokens
+
+        if self.rotated_codebook is None:
+            self.rotated_codebook = self._apply_key_rotary_pos_emb(self.rotated_codebook, cos)
+
+        if len(self.key_cache) <= layer_idx:
+            bsz, hd, _, dim = local_key.shape
+            self.key_cache.append(cumulated_key)
+            self.value_cache.append(cumulated_value)
+            if num_tokens != self.window_length:
+                local_key_ = local_key.new_zeros(bsz, hd, self.window_length, dim)
+                local_key_[:, :, :num_tokens] = local_key
+                local_value_ = local_value.new_zeros(bsz, hd, self.window_length, dim)
+                local_value_[:, :, :num_tokens] = local_value
+                local_key, local_value = local_key_, local_value_
+            self.key_buffers.append(local_key)
+            self.value_buffers.append(local_value)
+        else:
+            raise RuntimeError("Are you prefilling twice?")
+
     def update(
         self,
-        key_states: torch.Tensor,
-        value_states: torch.Tensor,
+        key_cnts: torch.Tensor,
+        cumsum_values_values: torch.Tensor,
         layer_idx: int,
+        num_tokens: int = 1,
         cache_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
@@ -98,13 +144,13 @@ class VectorQuantizedReRoPECache(Cache):
 
         # Update the number of seen tokens
         if layer_idx == 0:
-            self.seen_tokens += key_states.shape[-2]
+            self.seen_tokens += num_tokens
 
         # [bsz, num_heads, seq_len, head_dim]
         if len(self.key_cache) <= layer_idx:
             # Empty cache
-            self.key_cache.append(key_states)
-            self.value_cache.append(value_states)
+            self.key_cache.append(key_cnts)
+            self.value_cache.append(cumsum_values_values)
 
         else:
             # Growing cache
@@ -187,7 +233,9 @@ class LlamaFlashAttention2VectorQuantizedReRoPE(LlamaAttention):
     ):
 
         is_prefilling = past_key_value.get_seq_length(self.layer_idx) == 0
-        is_prefilling_with_memory = is_prefilling and query_states.shape[2] > past_key_value.window_length
+        is_prefilling_with_memory = (
+            is_prefilling and query_states.shape[2] > past_key_value.window_length + BLOCK_SIZE
+        )
 
         inputs = (query_states, key_states, value_states, position_ids, kv_seq_len, past_key_value)
         if is_prefilling_with_memory:
@@ -242,11 +290,16 @@ class LlamaFlashAttention2VectorQuantizedReRoPE(LlamaAttention):
         bsz, hd, q_len, hidden_size = query_states.shape
 
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+        # 2 2 1 1
+        # 2 2 3 1 1
+        # 2 2 3 3 1 1
         query_states1, key_states1 = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
-        w_position = torch.full_like(position_ids, past_key_value.window_length - 1)
+        w_position = torch.full_like(position_ids, past_key_value.window_length + 1)
         cos_at_w, sin_at_w = cos[w_position].unsqueeze(1), sin[w_position].unsqueeze(1)
         query_states2 = (query_states * cos_at_w) + (rotate_half(query_states) * sin_at_w)
         key_states2, vq_key_ids, vq_key_onehot = multi_head_single_quantize(key_states, past_key_value.codebook)
+        query_states3 = query_states2
+        key_states3 = key_states
 
         output = torch.zeros_like(query_states, memory_format=torch.contiguous_format)
         BLOCK_SIZE = 128
@@ -256,10 +309,18 @@ class LlamaFlashAttention2VectorQuantizedReRoPE(LlamaAttention):
             for _h in range(hd):
                 for qi in range(q_len):
                     boundary = max(0, (qi - WIN) // BLOCK_SIZE * BLOCK_SIZE)
+                    local_boundary = max(0, qi - WIN)
                     q1 = query_states1[_b, _h, qi]
-                    k1 = key_states1[_b, _h, boundary : qi + 1]
-                    v = value_states[_b, _h, max(0, (qi - WIN) // BLOCK_SIZE * BLOCK_SIZE) : qi + 1]
+                    k1 = key_states1[_b, _h, local_boundary : qi + 1]
+                    v = value_states[_b, _h, local_boundary : qi + 1]
                     attn = q1 @ k1.T
+                    if local_boundary > 0:
+                        q3 = query_states3[_b, _h, qi]
+                        k3 = key_states3[_b, _h, boundary:local_boundary]
+                        v3 = value_states[_b, _h, boundary:local_boundary]
+                        attn3 = q3 @ k3.T
+                        attn = torch.cat([attn, attn3], dim=0)
+                        v = torch.cat([v, v3], dim=0)
                     if boundary > 0:
                         q2 = query_states2[_b, _h, qi]
                         k2 = key_states2[_b, _h, :boundary]
@@ -282,6 +343,7 @@ class LlamaFlashAttention2VectorQuantizedReRoPE(LlamaAttention):
         past_key_value: VectorQuantizedReRoPECache,
     ):
         bsz, hd, q_len, hidden_size = query_states.shape
+
         cdsz = past_key_value.codebook.shape[1]  # codebook size
         device = query_states.device
         dtype = query_states.dtype
@@ -314,6 +376,7 @@ class LlamaFlashAttention2VectorQuantizedReRoPE(LlamaAttention):
         vq_value_states = torch.cumsum(vq_value_states.float(), 2)
         boundary_vec = vq_value_states.gather(2, boundary_in_unrolled.unsqueeze(-1).expand(-1, -1, -1, hidden_size))
         # NOTE torch.repeat_interleave cannot be batched by torch.vmap
+        # TODO benchmark gather-based impl
         boundary_vec = torch.vmap(torch.vmap(partial(torch.repeat_interleave, dim=0)))(boundary_vec, num_in_unrolled)
 
         vq_value_states[:, :, 1:] -= boundary_vec
@@ -339,22 +402,36 @@ class LlamaFlashAttention2VectorQuantizedReRoPE(LlamaAttention):
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
 
         query_states1, key_states1 = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
-        w_position = torch.full_like(position_ids, past_key_value.window_length - 1)
+        w_position = torch.full_like(position_ids, past_key_value.window_length + 1)
         cos_at_w, sin_at_w = cos[w_position].unsqueeze(1), sin[w_position].unsqueeze(1)
         query_states2 = (query_states * cos_at_w) + (rotate_half(query_states) * sin_at_w)
 
         # grouping
-        BLOCK_SIZE = 128  # MUST MATCH KERNEL
         vq_keys_cumsum_all = vq_keys_cumsum
-        vq_keys_cumsum = vq_keys_cumsum.view(bsz, hd, -1, BLOCK_SIZE, cdsz)[:, :, :, -1].contiguous()
+        vq_keys_cumsum = vq_keys_cumsum[:, :, BLOCK_SIZE - 1 :: BLOCK_SIZE].contiguous()
         vq_value_indices_all = vq_value_indices
-        vq_value_indices = vq_value_indices.view(bsz, hd, -1, BLOCK_SIZE, cdsz)[:, :, :, -1].contiguous()
-        # TODO value can be grouped as well. optimize later
+        vq_value_indices = vq_value_indices[:, :, BLOCK_SIZE - 1 :: BLOCK_SIZE].contiguous()
+
+        last_block = (q_len - past_key_value.window_length - BLOCK_SIZE) // BLOCK_SIZE - 1
+        last_vi = vq_value_indices[:, :, last_block].unsqueeze(-1).expand(-1, -1, -1, hidden_size)
+        last_v = vq_value_states.gather(2, last_vi)
+        cache_kwargs = {"sin": sin, "cos": cos}
+        # past_key_value.update_prefill(
+        #     cumulated_key=vq_keys_cumsum[:, :, last_block],
+        #     cumulated_value=last_v,
+        #     local_key=
+        #     layer_idx=self.layer_idx,
+        #     num_tokens=q_len,
+        #     cache_kwargs=cache_kwargs,
+        # )
 
         # Z, H, N_CTX, D_HEAD
+        assert query_states1.stride() == query_states2.stride()
+        assert key_states1.stride() == key_states.stride()
         query_states = self._type_guard((query_states1, query_states2))
-        key_states = self._type_guard((key_states1, past_key_value.codebook, vq_keys_cumsum.to(dtype)))
+        key_states = self._type_guard((key_states1, past_key_value.codebook, vq_keys_cumsum.to(dtype), key_states))
         value_states = self._type_guard((value_states, vq_value_states, vq_value_indices))
+
         out = vq_prefilling_kernel(
             *query_states,
             *key_states,
@@ -462,9 +539,10 @@ if __name__ == "__main__":
     module.eval()
 
     with torch.no_grad():
+        LEN = 511
         codebook = torch.randn(2, 128, 64, dtype=torch.float16, device="cuda")
-        x = torch.randn(1, 512, 128, dtype=torch.float16, device="cuda")  # bsz, qlen, hidden
-        position_ids = torch.arange(512, device="cuda").unsqueeze(0)  # bsz, length
+        x = torch.randn(1, LEN, 128, dtype=torch.float16, device="cuda")  # bsz, qlen, hidden
+        position_ids = torch.arange(LEN, device="cuda").unsqueeze(0)  # bsz, length
 
         cache = VectorQuantizedReRoPECache(256, codebook, False, attention_mode=AttentionMode.SORT_BASED_LINEAR)
         o_fast = module(hidden_states=x, position_ids=position_ids, past_key_value=cache)[0]
@@ -472,7 +550,7 @@ if __name__ == "__main__":
         cache = VectorQuantizedReRoPECache(256, codebook, False, attention_mode=AttentionMode.SLOW_REFERNECE)
         o_ref = module(hidden_states=x, position_ids=position_ids, past_key_value=cache)[0]
 
-        print((o_ref[0, 0] - o_fast[0, 0]).abs().max())
-        print(o_ref[0, 0])
-        print(o_fast[0, 0])
+        print((o_ref[0] - o_fast[0]).abs().max(1)[0])
+        print((o_ref[0] - o_fast[0]).abs().max(1)[0][:256].max())
+        print((o_ref[0] - o_fast[0]).abs().max(1)[0][256:].max())
         breakpoint()
